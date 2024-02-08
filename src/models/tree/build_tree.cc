@@ -18,6 +18,7 @@
 #include "legateboost.h"
 #include "../../cpp_utils/cpp_utils.h"
 #include "build_tree.h"
+#include <omp.h>
 
 namespace legateboost {
 
@@ -104,10 +105,11 @@ void WriteTreeOutput(legate::TaskContext context, const Tree& tree)
 
 struct GradientHistogram {
   // Dimensions
-  // 0. Depth
+  // 0. Node
   // 1. Feature
   // 2. Output
-  legate::Buffer<GPair, 3> gradient_sums;
+  // 3. Gradient and Hessian
+  legate::Buffer<double, 4> gradient_sums;
   int size;
   int num_features;
   int depth;
@@ -117,23 +119,21 @@ struct GradientHistogram {
     : num_features(num_features),
       depth(depth),
       num_outputs(num_outputs),
-      size((1 << depth) * num_features * num_outputs),
-      gradient_sums(legate::create_buffer<GPair, 3>({1 << depth, num_features, num_outputs}))
+      size((1 << depth) * num_features * num_outputs * 2),
+      gradient_sums(legate::create_buffer<double, 4>({1 << depth, num_features, num_outputs, 2}))
   {
-    auto ptr = gradient_sums.ptr({0, 0, 0});
-    std::fill(ptr, ptr + size, GPair{0.0, 0.0});
-  }
-  void Add(int feature, int position_in_level, int output, GPair g)
-  {
-    gradient_sums[{position_in_level, feature, output}] += g;
+    auto ptr = gradient_sums.ptr({0, 0, 0, 0});
+    std::fill(ptr, ptr + size, 0.0);
   }
   GPair Get(int feature, int position, int output)
   {
     int position_in_level = position - ((1 << depth) - 1);
-    return gradient_sums[{position_in_level, feature, output}];
+    return GPair{gradient_sums[{position_in_level, feature, output, 0}],
+                 gradient_sums[{position_in_level, feature, output, 1}]};
   }
 };
 
+template <bool USE_OMP>
 struct build_tree_fn {
   template <typename T>
   void operator()(legate::TaskContext context)
@@ -180,6 +180,8 @@ struct build_tree_fn {
     std::vector<int32_t> positions(num_rows);
     for (int64_t depth = 0; depth < max_depth; ++depth) {
       GradientHistogram histogram(num_features, depth, num_outputs);
+      double* hist_ptr = histogram.gradient_sums.ptr({0, 0, 0, 0});
+#pragma omp parallel for if (USE_OMP) reduction(+ : hist_ptr[:histogram.size])
       for (int64_t i = X_shape.lo[0]; i <= X_shape.hi[0]; i++) {
         auto index_local = i - X_shape.lo[0];
         auto position    = positions[index_local];
@@ -188,16 +190,19 @@ struct build_tree_fn {
         for (int64_t j = 0; j < num_features; j++) {
           if (X_accessor[{i, j}] <= split_proposal_accessor[{depth, j}]) {
             for (int64_t k = 0; k < num_outputs; ++k) {
-              histogram.Add(j, position_in_level, k, GPair{g_accessor[{i, k}], h_accessor[{i, k}]});
+              auto offset = histogram.gradient_sums.ptr({position_in_level, j, k, 0}) - hist_ptr;
+              hist_ptr[offset] += g_accessor[{i, k}];
+              hist_ptr[offset + 1] += h_accessor[{i, k}];
             }
           }
         }
       }
       SumAllReduce(context,
-                   reinterpret_cast<double*>(histogram.gradient_sums.ptr({0, 0, 0})),
+                   reinterpret_cast<double*>(histogram.gradient_sums.ptr({0, 0, 0, 0})),
                    histogram.size * 2);
       // Find the best split
-      double eps = 1e-5;
+      const double eps = 1e-5;
+#pragma omp parallel for if (USE_OMP)
       for (int node_id = (1 << depth) - 1; node_id < (1 << (depth + 1)) - 1; node_id++) {
         double best_gain = 0;
         int best_feature = -1;
@@ -251,7 +256,8 @@ struct build_tree_fn {
         }
       }
 
-      // Update the positions
+// Update the positions
+#pragma omp parallel for if (USE_OMP)
       for (int64_t i = X_shape.lo[0]; i <= X_shape.hi[0]; i++) {
         auto index_local = i - X_shape.lo[0];
         int& pos         = positions[index_local];
@@ -274,7 +280,12 @@ struct build_tree_fn {
 /*static*/ void BuildTreeTask::cpu_variant(legate::TaskContext context)
 {
   const auto& X = context.input(0).data();
-  legateboost::type_dispatch_float(X.code(), build_tree_fn(), context);
+  legateboost::type_dispatch_float(X.code(), build_tree_fn<false>(), context);
+}
+/*static*/ void BuildTreeTask::omp_variant(legate::TaskContext context)
+{
+  const auto& X = context.input(0).data();
+  legateboost::type_dispatch_float(X.code(), build_tree_fn<true>(), context);
 }
 
 }  // namespace legateboost
