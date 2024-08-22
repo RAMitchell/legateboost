@@ -190,7 +190,7 @@ __global__ static void __launch_bounds__(THREADS_PER_BLOCK, MIN_CTAS_PER_SM)
   }
 }
 
-template <typename TYPE, int ELEMENTS_PER_THREAD, int FEATURES_PER_BLOCK>
+template <typename TYPE>
 __global__ static void __launch_bounds__(THREADS_PER_BLOCK, MIN_CTAS_PER_SM)
   fill_histogram(legate::AccessorRO<TYPE, 3> X,
                  size_t n_features,
@@ -204,45 +204,31 @@ __global__ static void __launch_bounds__(THREADS_PER_BLOCK, MIN_CTAS_PER_SM)
                  legate::Buffer<IntegerGPair, 2> node_sums,
                  GradientQuantiser quantiser)
 {
-  // block dimensions are (THREADS_PER_BLOCK, 1, 1)
-  // each thread processes ELEMENTS_PER_THREAD samples and FEATURES_PER_BLOCK features
-  // the features to process are defined via blockIdx.y
-
-  // further improvements:
-  // * quantize values to work with int instead of double
-
-#pragma unroll
-  for (int32_t elementIdx = 0; elementIdx < ELEMENTS_PER_THREAD; ++elementIdx) {
-    // within each iteration a (THREADS_PER_BLOCK, FEATURES_PER_BLOCK)-block of
-    // data from X is processed.
-
-    // check if thread has actual work to do
-    int64_t idx      = (blockIdx.x + elementIdx * gridDim.x) * THREADS_PER_BLOCK + threadIdx.x;
-    bool validThread = idx < batch.InstancesInBatch();
+  // Grid stride loop
+  for (std::size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+       idx < batch.InstancesInBatch() * n_features;
+       idx += blockDim.x * gridDim.x) {
+    auto i           = idx / n_features;
+    int feature      = idx % n_features;
+    bool validThread = i < batch.InstancesInBatch();
     if (!validThread) continue;
-    auto [sampleNode, localSampleId] = batch.instances_begin[idx];
+    auto [sampleNode, localSampleId] = batch.instances_begin[i];
     int64_t globalSampleId           = localSampleId + sample_offset;
-
-    bool computeHistogram = ComputeHistogramBin(
+    bool computeHistogram            = ComputeHistogramBin(
       sampleNode, node_sums, histogram.ContainsNode(BinaryTree::Parent(sampleNode)));
 
-    for (int32_t output = 0; output < n_outputs; output++) {
-      auto gpair_quantised =
-        quantiser.Quantise({g[{globalSampleId, 0, output}], h[{globalSampleId, 0, output}]});
-      for (int32_t featureIdx = 0; featureIdx < FEATURES_PER_BLOCK; featureIdx++) {
-        int32_t feature = featureIdx + blockIdx.y * FEATURES_PER_BLOCK;
-        if (computeHistogram && feature < n_features) {
-          auto x_value = X[{globalSampleId, feature, 0}];
-          auto bin_idx = split_proposals.FindBin(x_value, feature);
+    if (computeHistogram && feature < n_features) {
+      auto x_value = X[{globalSampleId, feature, 0}];
+      auto bin_idx = split_proposals.FindBin(x_value, feature);
+      if (bin_idx == SparseSplitProposals<TYPE>::NOT_FOUND) continue;
+      for (int32_t output = 0; output < n_outputs; output++) {
+        auto gpair_quantised =
+          quantiser.Quantise({g[{globalSampleId, 0, output}], h[{globalSampleId, 0, output}]});
 
-          // bin_idx is the first sample that is larger than x_value
-          if (bin_idx != SparseSplitProposals<TYPE>::NOT_FOUND) {
-            Histogram::atomic_add_type* addPosition = reinterpret_cast<Histogram::atomic_add_type*>(
-              &histogram[{sampleNode, output, bin_idx}]);
-            atomicAdd(addPosition, gpair_quantised.grad);
-            atomicAdd(addPosition + 1, gpair_quantised.hess);
-          }
-        }
+        Histogram::atomic_add_type* addPosition =
+          reinterpret_cast<Histogram::atomic_add_type*>(&histogram[{sampleNode, output, bin_idx}]);
+        atomicAdd(addPosition, gpair_quantised.grad);
+        atomicAdd(addPosition + 1, gpair_quantised.hess);
       }
     }
   }
@@ -675,27 +661,19 @@ struct TreeBuilder {
                         legate::AccessorRO<double, 3> h,
                         NodeBatch batch)
   {
-    // TODO adjust kernel parameters dynamically
-    constexpr size_t elements_per_thread = 8;
-    constexpr size_t features_per_block  = 16;
-
-    const size_t blocks_x =
-      (batch.InstancesInBatch() + THREADS_PER_BLOCK * elements_per_thread - 1) /
-      (THREADS_PER_BLOCK * elements_per_thread);
-    const size_t blocks_y = (num_features + features_per_block - 1) / features_per_block;
-    dim3 grid_shape       = dim3(blocks_x, blocks_y, 1);
-    fill_histogram<TYPE, elements_per_thread, features_per_block>
-      <<<grid_shape, THREADS_PER_BLOCK, 0, stream>>>(X,
-                                                     num_features,
-                                                     X_shape.lo[0],
-                                                     g,
-                                                     h,
-                                                     num_outputs,
-                                                     split_proposals,
-                                                     batch,
-                                                     histogram,
-                                                     tree.node_sums,
-                                                     quantiser);
+    const size_t blocks_x = 256;
+    dim3 grid_shape       = dim3(blocks_x, 1, 1);
+    fill_histogram<TYPE><<<grid_shape, THREADS_PER_BLOCK, 0, stream>>>(X,
+                                                                       num_features,
+                                                                       X_shape.lo[0],
+                                                                       g,
+                                                                       h,
+                                                                       num_outputs,
+                                                                       split_proposals,
+                                                                       batch,
+                                                                       histogram,
+                                                                       tree.node_sums,
+                                                                       quantiser);
 
     CHECK_CUDA_STREAM(stream);
     static_assert(sizeof(GPair) == 2 * sizeof(double), "GPair must be 2 doubles");
