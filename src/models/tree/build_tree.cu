@@ -72,6 +72,7 @@ class GradientQuantiser {
                     legate::Rect<3> g_shape,
                     cudaStream_t stream)
   {
+    CHECK_CUDA(cudaDeviceSynchronize());
     auto thrust_alloc = ThrustAllocator(legate::Memory::GPU_FB_MEM);
     auto policy       = DEFAULT_POLICY(thrust_alloc).on(stream);
     auto counting     = thrust::make_counting_iterator(0);
@@ -83,35 +84,36 @@ class GradientQuantiser {
     GPair local_abs_sum =
       thrust::reduce(policy, zip_gpair, zip_gpair + n, GPair{0.0, 0.0}, thrust::plus<GPair>());
 
+    /*
     AllReduce(context,
               tcb::span<double>{reinterpret_cast<double*>(&local_abs_sum), 2},
               [](double a, double b) { return std::max(a, b); });
-
-    /*
-CHECK_CUDA(cudaStreamSynchronize(stream));
-
-// auto local_abs_sum_device = legate::create_buffer<GPair, 1>(1);
-thrust::device_vector<double> local_abs_sum_device(2);
-CHECK_CUDA(cudaMemcpyAsync(local_abs_sum_device.data().get(),
-                     &local_abs_sum,
-                     sizeof(GPair),
-                     cudaMemcpyHostToDevice,
-                     stream));
-CHECK_CUDA(cudaStreamSynchronize(stream));
-// Take the max of the local sums
-AllReduce(context,
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-    tcb::span<double>{local_abs_sum_device.data().get(), 2},
-    ncclMax,
-    stream);
-CHECK_CUDA(cudaStreamSynchronize(stream));
-CHECK_CUDA(cudaMemcpyAsync(&local_abs_sum,
-                     local_abs_sum_device.data().get(),
-                     sizeof(GPair),
-                     cudaMemcpyDeviceToHost,
-                     stream));
-CHECK_CUDA(cudaStreamSynchronize(stream));
 */
+
+    CHECK_CUDA(cudaStreamSynchronize(stream));
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    // auto local_abs_sum_device = legate::create_buffer<GPair, 1>(1);
+    thrust::device_vector<double> local_abs_sum_device(2);
+    CHECK_CUDA(cudaMemcpyAsync(local_abs_sum_device.data().get(),
+                               &local_abs_sum,
+                               sizeof(GPair),
+                               cudaMemcpyHostToDevice,
+                               stream));
+    CHECK_CUDA(cudaStreamSynchronize(stream));
+    // Take the max of the local sums
+    AllReduce(context,
+              // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+              tcb::span<double>{local_abs_sum_device.data().get(), 2},
+              ncclMax,
+              stream);
+    CHECK_CUDA(cudaStreamSynchronize(stream));
+    CHECK_CUDA(cudaMemcpyAsync(&local_abs_sum,
+                               local_abs_sum_device.data().get(),
+                               sizeof(GPair),
+                               cudaMemcpyDeviceToHost,
+                               stream));
+    CHECK_CUDA(cudaStreamSynchronize(stream));
 
     // We will quantise values between -max_int and max_int
     int64_t const max_int = std::numeric_limits<int32_t>::max();
@@ -1302,8 +1304,11 @@ struct build_tree_fn {
 
     Tree tree(max_nodes, num_outputs, stream, thrust_exec_policy);
 
+    CHECK_CUDA(cudaDeviceSynchronize());
     SparseSplitProposals<T> const split_proposals =
       SelectSplitSamples(context, X_accessor, X_shape, split_samples, seed, dataset_rows, stream);
+
+    CHECK_CUDA(cudaDeviceSynchronize());
 
     GradientQuantiser const quantiser(context, g_accessor, h_accessor, g_shape, stream);
 
