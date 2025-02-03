@@ -16,6 +16,7 @@
 #include <cuda/std/tuple>
 #include <cuda/functional>
 #include <thrust/execution_policy.h>
+#include <thrust/device_vector.h>
 #include <thrust/iterator/constant_iterator.h>
 #include <thrust/iterator/discard_iterator.h>
 #include <thrust/sort.h>
@@ -84,19 +85,26 @@ class GradientQuantiser {
 
     CHECK_CUDA(cudaStreamSynchronize(stream));
 
-    auto local_abs_sum_device = legate::create_buffer<GPair, 1>(1);
-    CHECK_CUDA(cudaMemcpyAsync(
-      local_abs_sum_device.ptr(0), &local_abs_sum, sizeof(GPair), cudaMemcpyHostToDevice, stream));
+    // auto local_abs_sum_device = legate::create_buffer<GPair, 1>(1);
+    thrust::device_vector<double> local_abs_sum_device(2);
+    CHECK_CUDA(cudaMemcpyAsync(local_abs_sum_device.data().get(),
+                               &local_abs_sum,
+                               sizeof(GPair),
+                               cudaMemcpyHostToDevice,
+                               stream));
     CHECK_CUDA(cudaStreamSynchronize(stream));
     // Take the max of the local sums
     AllReduce(context,
               // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-              tcb::span<double>{reinterpret_cast<double*>(local_abs_sum_device.ptr(0)), 2},
+              tcb::span<double>{local_abs_sum_device.data().get(), 2},
               ncclMax,
               stream);
     CHECK_CUDA(cudaStreamSynchronize(stream));
-    CHECK_CUDA(cudaMemcpyAsync(
-      &local_abs_sum, local_abs_sum_device.ptr(0), sizeof(GPair), cudaMemcpyDeviceToHost, stream));
+    CHECK_CUDA(cudaMemcpyAsync(&local_abs_sum,
+                               local_abs_sum_device.data().get(),
+                               sizeof(GPair),
+                               cudaMemcpyDeviceToHost,
+                               stream));
     CHECK_CUDA(cudaStreamSynchronize(stream));
 
     // We will quantise values between -max_int and max_int
