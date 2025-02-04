@@ -36,6 +36,12 @@
 
 namespace legateboost {
 
+legate::Logger& logger()
+{
+  static legate::Logger log("legate-boost");
+  return log;
+}
+
 namespace {
 
 struct NodeBatch {
@@ -881,6 +887,8 @@ auto SelectSplitSamples(legate::TaskContext context,
                         int64_t dataset_rows,
                         cudaStream_t stream) -> SparseSplitProposals<T>
 {
+  CHECK_CUDA(cudaStreamSynchronize(stream));
+  logger().info() << "1";
   auto thrust_alloc = ThrustAllocator(legate::Memory::GPU_FB_MEM);
   auto policy       = DEFAULT_POLICY(thrust_alloc).on(stream);
   auto num_features = X_shape.hi[1] - X_shape.lo[1] + 1;
@@ -905,6 +913,9 @@ auto SelectSplitSamples(legate::TaskContext context,
     draft_proposals[{j, i}] = has_data ? X[{row, j, 0}] : T(0);
   });
 
+  CHECK_CUDA(cudaStreamSynchronize(stream));
+  logger().info() << "2";
+
   // Sum reduce over all workers
   SumAllReduce(
     context, tcb::span<T>(draft_proposals.ptr({0, 0}), num_features * split_samples), stream);
@@ -919,6 +930,9 @@ auto SelectSplitSamples(legate::TaskContext context,
       return i / split_samples;
     });
 
+  CHECK_CUDA(cudaStreamSynchronize(stream));
+  logger().info() << "3";
+
   // Segmented sort
   auto begin =
     thrust::make_zip_iterator(thrust::make_tuple(keys.ptr(0), draft_proposals.ptr({0, 0})));
@@ -926,6 +940,9 @@ auto SelectSplitSamples(legate::TaskContext context,
     if (thrust::get<0>(a) != thrust::get<0>(b)) { return thrust::get<0>(a) < thrust::get<0>(b); }
     return thrust::get<1>(a) < thrust::get<1>(b);
   });
+
+  CHECK_CUDA(cudaStreamSynchronize(stream));
+  logger().info() << "4";
 
   // Extract the unique values
   auto out_keys        = legate::create_buffer<int32_t, 1>(num_features * split_samples);
@@ -949,6 +966,10 @@ auto SelectSplitSamples(legate::TaskContext context,
                         thrust::make_constant_iterator(1),
                         thrust::make_discard_iterator(),
                         row_pointers.ptr(1));
+
+  CHECK_CUDA(cudaStreamSynchronize(stream));
+  logger().info() << "5";
+
   // Scan the counts to get the row pointers for a CSR matrix
   tcb::span<int32_t> const row_pointers_span(row_pointers.ptr(0), num_features + 1);
   thrust::inclusive_scan(policy,
@@ -962,6 +983,8 @@ auto SelectSplitSamples(legate::TaskContext context,
     auto end                 = row_pointers_span[i + 1];
     split_proposals[end - 1] = std::numeric_limits<T>::infinity();
   });
+
+  logger().info() << "6";
 
   CHECK_CUDA(cudaStreamSynchronize(stream));
   row_samples.destroy();
@@ -1305,10 +1328,13 @@ struct build_tree_fn {
     Tree tree(max_nodes, num_outputs, stream, thrust_exec_policy);
 
     CHECK_CUDA(cudaDeviceSynchronize());
+    logger().info() << "Before SelectSplitSamples";
     SparseSplitProposals<T> const split_proposals =
       SelectSplitSamples(context, X_accessor, X_shape, split_samples, seed, dataset_rows, stream);
 
     CHECK_CUDA(cudaDeviceSynchronize());
+
+    logger().info() << "Before quantiser";
 
     GradientQuantiser const quantiser(context, g_accessor, h_accessor, g_shape, stream);
 
