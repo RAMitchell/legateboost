@@ -84,20 +84,22 @@ class GradientQuantiser {
     auto counting     = thrust::make_counting_iterator(0);
     auto num_outputs  = g_shape.hi[2] - g_shape.lo[2] + 1;
     auto n            = (g_shape.hi[0] - g_shape.lo[0] + 1) * num_outputs;
+    logger().info() << "Computing number of items " << n;
+    logger().info() << "G shape " << g_shape;
     auto zip_gpair =
       thrust::make_transform_iterator(counting, GetAbsGPair{narrow<int>(num_outputs), g, h});
     CHECK_CUDA(cudaStreamSynchronize(stream));
     GPair local_abs_sum =
       thrust::reduce(policy, zip_gpair, zip_gpair + n, GPair{0.0, 0.0}, thrust::plus<GPair>());
+    CHECK_CUDA(cudaStreamSynchronize(stream));
+    CHECK_CUDA(cudaDeviceSynchronize());
+    logger().info() << "After reduce ";
 
     /*
     AllReduce(context,
               tcb::span<double>{reinterpret_cast<double*>(&local_abs_sum), 2},
               [](double a, double b) { return std::max(a, b); });
 */
-
-    CHECK_CUDA(cudaStreamSynchronize(stream));
-    CHECK_CUDA(cudaDeviceSynchronize());
 
     // auto local_abs_sum_device = legate::create_buffer<GPair, 1>(1);
     thrust::device_vector<double> local_abs_sum_device(2);
